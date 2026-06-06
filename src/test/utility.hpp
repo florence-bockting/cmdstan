@@ -285,6 +285,81 @@ void parse_sample(const std::string &path, std::vector<std::string> &config,
 }
 
 /**
+ * Result of comparing two Stan sample CSV files.
+ */
+struct sample_csv_compare_result {
+  bool match;
+  size_t first_mismatch_row;  // 1-indexed data row; 0 if match
+  size_t first_mismatch_col;  // 1-indexed column; 0 if match
+};
+
+/**
+ * Compare numeric sample rows between two Stan CSV files.
+ *
+ * @param golden_path Reference CSV path.
+ * @param actual_path CSV path to compare.
+ * @param from_row First data row to compare (1-indexed, after header).
+ * @param to_row Last data row to compare (1-indexed); 0 compares through last row.
+ * @return Comparison result; first mismatch row/col are 0 when match is true.
+ */
+sample_csv_compare_result compare_sample_csv(const std::string &golden_path,
+                                             const std::string &actual_path,
+                                             size_t from_row = 1,
+                                             size_t to_row = 0) {
+  sample_csv_compare_result result{true, 0, 0};
+
+  std::vector<std::string> golden_config, golden_header, actual_config,
+      actual_header;
+  std::vector<double> golden_cells, actual_cells;
+  parse_sample(golden_path, golden_config, golden_header, golden_cells);
+  parse_sample(actual_path, actual_config, actual_header, actual_cells);
+
+  if (golden_header.empty() || actual_header.empty()) {
+    result.match = false;
+    result.first_mismatch_row = from_row > 0 ? from_row : 1;
+    result.first_mismatch_col = 1;
+    return result;
+  }
+
+  size_t num_cols = 1;
+  for (char c : golden_header[0]) {
+    if (c == ',')
+      ++num_cols;
+  }
+
+  size_t golden_rows = golden_cells.size() / num_cols;
+  size_t actual_rows = actual_cells.size() / num_cols;
+
+  if (to_row == 0) {
+    to_row = std::min(golden_rows, actual_rows);
+  }
+
+  if (from_row == 0 || from_row > to_row || to_row > golden_rows
+      || to_row > actual_rows) {
+    result.match = false;
+    result.first_mismatch_row = from_row > 0 ? from_row : 1;
+    result.first_mismatch_col = 1;
+    return result;
+  }
+
+  for (size_t row = from_row; row <= to_row; ++row) {
+    size_t golden_offset = (row - 1) * num_cols;
+    size_t actual_offset = (row - 1) * num_cols;
+    for (size_t col = 0; col < num_cols; ++col) {
+      if (golden_cells[golden_offset + col]
+          != actual_cells[actual_offset + col]) {
+        result.match = false;
+        result.first_mismatch_row = row;
+        result.first_mismatch_col = col + 1;
+        return result;
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
  * Given vector of strings, return index of first element
  * which contains a specified substring.
  *

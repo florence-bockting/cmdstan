@@ -72,6 +72,7 @@ test/interface/output_sig_figs_test$(EXE):        $(call depends_on_test_models,
 test/interface/pathfinder_test$(EXE):             $(call depends_on_test_models, multi_normal_model eight_schools empty)
 test/interface/permissions_test$(EXE):            $(call depends_on_test_models, test_model)
 test/interface/print_uninitialized_test$(EXE):    $(call depends_on_test_models, print_uninitialized)
+test/interface/checkpoint_resume_test$(EXE):       $(call depends_on_test_models, eight_schools test_model)
 test/interface/save_metric_json_test$(EXE):       $(call depends_on_test_models, simplex_model multi_normal_model)
 test/interface/variational_output_test$(EXE):     $(call depends_on_test_models, variational_output)
 

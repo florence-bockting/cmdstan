@@ -52,7 +52,10 @@
 #include <stan/services/sample/hmc_static_unit_e.hpp>
 #include <stan/services/sample/hmc_static_unit_e_adapt.hpp>
 #include <stan/services/sample/standalone_gqs.hpp>
+#include <stan/services/util/checkpoint_io.hpp>
+#include <cstdlib>
 #include <fstream>
+#include <optional>
 #include <iostream>
 #include <memory>
 #include <sstream>
@@ -195,6 +198,25 @@ int command(int argc, const char *argv[]) {
   std::vector<stan::callbacks::json_writer<std::ofstream>>
       diagnostic_json_writers;
   std::vector<stan::callbacks::json_writer<std::ofstream>> metric_json_writers;
+  std::vector<std::unique_ptr<atomic_checkpoint_writer>> checkpoint_writers;
+  std::vector<std::optional<stan::services::util::checkpoint_state>>
+      loaded_checkpoints;
+  std::vector<stan::services::util::checkpoint_options> checkpoint_opts;
+  std::vector<std::string> checkpoint_paths;
+  bool resume_sampling = false;
+  int checkpoint_freq = 0;
+
+  if (user_method->arg("sample")) {
+    checkpoint_freq = get_arg_val<int_argument>(parser, "method", "sample",
+                                                "checkpoint_freq");
+    checkpoint_paths = checkpoint_filenames(output_file, num_chains, id);
+    for (size_t i = 0; i < num_chains; ++i) {
+      if (stan::services::util::checkpoint_exists(checkpoint_paths[i])) {
+        resume_sampling = true;
+        break;
+      }
+    }
+  }
 
   bool save_single_paths
       = user_method->arg("pathfinder")
@@ -227,6 +249,17 @@ int command(int argc, const char *argv[]) {
       }
     }
     init_null_writers(diagnostic_csv_writers, num_chains);
+  } else if (resume_sampling) {
+    init_append_writers(sample_writers, num_chains, id, output_file, "", ".csv",
+                        sig_figs, "# ");
+    if (!diagnostic_file.empty()) {
+      init_append_writers(diagnostic_csv_writers, num_chains, id,
+                          diagnostic_file, "", ".csv", sig_figs, "# ");
+      init_null_writers(diagnostic_json_writers, num_chains);
+    } else {
+      init_null_writers(diagnostic_csv_writers, num_chains);
+      init_null_writers(diagnostic_json_writers, num_chains);
+    }
   } else {
     init_filestream_writers(sample_writers, num_chains, id, output_file, "",
                             ".csv", sig_figs, "# ");
@@ -290,11 +323,13 @@ int command(int argc, const char *argv[]) {
     write_config(json_args, parser, model);
   }
 
-  for (int i = 0; i < num_chains; ++i) {
-    write_config(sample_writers[i], parser, model);
-    write_stan(diagnostic_csv_writers[i]);
-    write_model(diagnostic_csv_writers[i], model.model_name());
-    parser.print(diagnostic_csv_writers[i]);
+  if (!resume_sampling) {
+    for (int i = 0; i < num_chains; ++i) {
+      write_config(sample_writers[i], parser, model);
+      write_stan(diagnostic_csv_writers[i]);
+      write_model(diagnostic_csv_writers[i], model.model_name());
+      parser.print(diagnostic_csv_writers[i]);
+    }
   }
 
   //////////////////////////////////////////////////
@@ -568,6 +603,34 @@ int command(int argc, const char *argv[]) {
     bool save_warmup
         = get_arg_val<bool_argument>(parser, "method", "sample", "save_warmup");
 
+    loaded_checkpoints.resize(num_chains);
+    checkpoint_opts.resize(num_chains);
+    checkpoint_writers.clear();
+    if (resume_sampling || checkpoint_freq > 0) {
+      checkpoint_writers.reserve(num_chains);
+      for (size_t i = 0; i < num_chains; ++i) {
+        if (resume_sampling) {
+          loaded_checkpoints[i]
+              = stan::services::util::read_checkpoint(checkpoint_paths[i]);
+          validate_checkpoint_for_resume(*loaded_checkpoints[i], id + i,
+                                         random_seed, num_warmup, num_samples,
+                                         num_thin);
+        }
+        if (checkpoint_freq > 0) {
+          checkpoint_writers.emplace_back(
+              std::make_unique<atomic_checkpoint_writer>(checkpoint_paths[i]));
+        }
+        checkpoint_opts[i].freq = checkpoint_freq;
+        checkpoint_opts[i].writer = checkpoint_freq > 0
+                                        ? checkpoint_writers[i].get()
+                                        : nullptr;
+        checkpoint_opts[i].resume = loaded_checkpoints[i].has_value()
+                                      ? &loaded_checkpoints[i].value()
+                                      : nullptr;
+        checkpoint_opts[i].skip_headers = resume_sampling;
+      }
+    }
+
     list_argument *algo = dynamic_cast<list_argument *>(
         parser.arg("method")->arg("sample")->arg("algorithm"));
     std::string algo_name = algo->value();
@@ -669,7 +732,7 @@ int command(int argc, const char *argv[]) {
                 refresh, stepsize, jitter, max_depth, delta, gamma, kappa, t0,
                 init_buffer, term_buffer, window, interrupt, logger,
                 init_writers, sample_writers, diagnostic_csv_writers,
-                metric_json_writers);
+                metric_json_writers, checkpoint_opts);
           } else if (metric == "dense_e") {
             return_code = stan::services::sample::hmc_nuts_dense_e_adapt(
                 model, num_chains, init_contexts, random_seed, id, init_radius,
@@ -677,7 +740,7 @@ int command(int argc, const char *argv[]) {
                 stepsize, jitter, max_depth, delta, gamma, kappa, t0,
                 init_buffer, term_buffer, window, interrupt, logger,
                 init_writers, sample_writers, diagnostic_csv_writers,
-                metric_json_writers);
+                metric_json_writers, checkpoint_opts);
           } else if (metric == "diag_e" && metric_supplied == true) {
             return_code = stan::services::sample::hmc_nuts_diag_e_adapt(
                 model, num_chains, init_contexts, metric_contexts, random_seed,
@@ -685,7 +748,7 @@ int command(int argc, const char *argv[]) {
                 refresh, stepsize, jitter, max_depth, delta, gamma, kappa, t0,
                 init_buffer, term_buffer, window, interrupt, logger,
                 init_writers, sample_writers, diagnostic_csv_writers,
-                metric_json_writers);
+                metric_json_writers, checkpoint_opts);
           } else if (metric == "diag_e") {
             return_code = stan::services::sample::hmc_nuts_diag_e_adapt(
                 model, num_chains, init_contexts, random_seed, id, init_radius,
@@ -693,14 +756,18 @@ int command(int argc, const char *argv[]) {
                 stepsize, jitter, max_depth, delta, gamma, kappa, t0,
                 init_buffer, term_buffer, window, interrupt, logger,
                 init_writers, sample_writers, diagnostic_csv_writers,
-                metric_json_writers);
+                metric_json_writers, checkpoint_opts);
           } else if (metric == "unit_e") {
             return_code = stan::services::sample::hmc_nuts_unit_e_adapt(
                 model, num_chains, init_contexts, random_seed, id, init_radius,
                 num_warmup, num_samples, num_thin, save_warmup, refresh,
                 stepsize, jitter, max_depth, delta, gamma, kappa, t0, interrupt,
                 logger, init_writers, sample_writers, diagnostic_csv_writers,
-                metric_json_writers);
+                metric_json_writers, checkpoint_opts);
+          }
+          if (return_code == return_codes::OK && checkpoint_freq > 0
+              && std::getenv("CMDSTAN_KEEP_CHECKPOINT") == nullptr) {
+            remove_checkpoint_files(checkpoint_paths);
           }
         }
       } else if (engine == "static") {

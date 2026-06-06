@@ -14,8 +14,13 @@
 #include <stan/model/log_prob_grad.hpp>
 #include <stan/model/model_base.hpp>
 #include <stan/services/sample/standalone_gqs.hpp>
+#include <stan/services/util/checkpoint_io.hpp>
 #include <boost/algorithm/string.hpp>
+#include <cstdio>
 #include <fstream>
+#include <limits>
+#include <memory>
+#include <optional>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -710,6 +715,130 @@ void init_filestream_writers(std::vector<T> &writers, unsigned int num_chains,
   for (size_t i = 0; i < num_chains; ++i) {
     auto ofs = file::safe_create(filenames[i], sig_figs);
     writers.emplace_back(std::move(ofs), std::forward<Ts>(args)...);
+  }
+}
+
+template <typename T, typename... Ts>
+void init_append_writers(std::vector<T> &writers, unsigned int num_chains,
+                         unsigned int id, const std::string &filename,
+                         const std::string &tag, const std::string &suffix,
+                         int sig_figs, Ts &&... args) {
+  writers.reserve(num_chains);
+  auto filenames = file::make_filenames(filename, tag, suffix, num_chains, id);
+  for (size_t i = 0; i < num_chains; ++i) {
+    auto ofs = std::make_unique<std::ofstream>(filenames[i], std::ios::app);
+    ofs->exceptions(std::ofstream::badbit | std::ofstream::failbit);
+    if (sig_figs > -1) {
+      ofs->precision(sig_figs);
+    }
+    writers.emplace_back(std::move(ofs), std::forward<Ts>(args)...);
+  }
+}
+
+class atomic_checkpoint_writer : public stan::callbacks::structured_writer {
+ public:
+  explicit atomic_checkpoint_writer(std::string path) : path_(std::move(path)) {
+    reset_inner();
+  }
+
+  void begin_record() override {
+    reset_inner();
+    inner_->begin_record();
+  }
+
+  void end_record() override {
+    inner_->end_record();
+    const std::string tmp_path = path_ + ".tmp";
+    {
+      std::ofstream out(tmp_path, std::ios::trunc);
+      if (!out.good()) {
+        throw std::runtime_error("cannot write checkpoint file: " + tmp_path);
+      }
+      out << buffer_->str();
+      out.flush();
+    }
+    if (std::rename(tmp_path.c_str(), path_.c_str()) != 0) {
+      throw std::runtime_error("checkpoint rename failed: " + path_);
+    }
+  }
+
+  void write(const std::string &key, const std::string &value) override {
+    inner_->write(key, value);
+  }
+
+  void write(const std::string &key, int value) override {
+    inner_->write(key, value);
+  }
+
+  void write(const std::string &key, double value) override {
+    inner_->write(key, value);
+  }
+
+  void write(const std::string &key,
+             const std::vector<double> &values) override {
+    inner_->write(key, values);
+  }
+
+ private:
+  using noop_ostringstream_deleter = void (*)(std::ostringstream *);
+
+  static void noop_ostringstream_delete(std::ostringstream *) {}
+
+  void reset_inner() {
+    buffer_ = std::make_unique<std::ostringstream>();
+    buffer_->precision(std::numeric_limits<double>::max_digits10);
+    inner_ = std::make_unique<stan::callbacks::json_writer<
+        std::ostringstream, noop_ostringstream_deleter>>(
+        std::unique_ptr<std::ostringstream, noop_ostringstream_deleter>(
+            buffer_.get(), noop_ostringstream_delete));
+  }
+
+  std::string path_;
+  std::unique_ptr<std::ostringstream> buffer_;
+  std::unique_ptr<stan::callbacks::json_writer<std::ostringstream,
+                                              noop_ostringstream_deleter>>
+      inner_;
+};
+
+inline std::vector<std::string>
+checkpoint_filenames(const std::string &output_file, unsigned int num_chains,
+                     unsigned int id) {
+  return file::make_filenames(output_file, "_checkpoint", ".json", num_chains,
+                              id);
+}
+
+inline void validate_checkpoint_for_resume(
+    const stan::services::util::checkpoint_state &state, unsigned int chain_id,
+    unsigned int random_seed, int num_warmup, int num_samples, int thin) {
+  if (state.phase != "sampling") {
+    throw std::runtime_error(
+        "checkpoint phase must be sampling to resume sampling");
+  }
+  if (state.chain_id != static_cast<int>(chain_id)) {
+    throw std::runtime_error("checkpoint chain_id does not match command id");
+  }
+  if (state.random_seed != random_seed) {
+    throw std::runtime_error("checkpoint random_seed does not match command");
+  }
+  if (state.num_warmup != num_warmup) {
+    throw std::runtime_error("checkpoint num_warmup does not match command");
+  }
+  if (state.num_samples != num_samples) {
+    throw std::runtime_error("checkpoint num_samples does not match command");
+  }
+  if (state.thin != thin) {
+    throw std::runtime_error("checkpoint thin does not match command");
+  }
+  if (state.iteration < num_warmup
+      || state.iteration >= num_warmup + num_samples) {
+    throw std::runtime_error("checkpoint iteration is outside sampling range");
+  }
+}
+
+inline void remove_checkpoint_files(const std::vector<std::string> &paths) {
+  for (const auto &path : paths) {
+    std::remove(path.c_str());
+    std::remove((path + ".tmp").c_str());
   }
 }
 

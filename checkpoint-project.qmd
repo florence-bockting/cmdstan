@@ -1,0 +1,473 @@
+# CmdStan Checkpoint / Resume — Implementation Summary
+
+This document describes all changes made for native sampling-phase checkpointing in CmdStan and Stan. The work spans two repositories: the **Stan** submodule (algorithm and I/O core) and **CmdStan** (CLI, file management, and integration tests).
+
+## Goal
+
+Allow an HMC/NUTS sampling run to be **interrupted and resumed** within the same chain, producing output that continues bit-identically from the checkpoint onward (when state is fully restored).
+
+**Scope of v1:**
+
+- Sampling phase only (after warmup completes)
+- HMC engine with NUTS, adaptive variants: `diag_e`, `dense_e`, `unit_e`
+- Automatic resume when a checkpoint file already exists
+- Periodic checkpoint writes controlled by `checkpoint_freq`
+
+**Explicitly deferred:**
+
+- Warmup-phase checkpointing (adaptation windows are not serialized)
+- Static HMC, non-adaptive samplers, pathfinder, variational, etc.
+
+---
+
+## Architecture Overview
+
+```{mermaid}
+flowchart TD
+    CLI["CmdStan command.hpp"]
+    Args["arg_sample.hpp: checkpoint_freq"]
+    Detect["Detect checkpoint file exists"]
+    Append["Append mode CSV writers"]
+    Validate["validate_checkpoint_for_resume"]
+    Opts["checkpoint_options per chain"]
+    RAS["run_adaptive_sampler"]
+    GT["generate_transitions"]
+    IO["checkpoint_io.hpp"]
+    Writer["atomic_checkpoint_writer"]
+
+    CLI --> Args
+    CLI --> Detect
+    Detect -->|resume| Append
+    Detect --> Validate
+    CLI --> Opts
+    Opts --> RAS
+    RAS -->|save| GT
+    GT -->|callback| Writer
+    Writer --> IO
+    RAS -->|restore| IO
+    Validate --> IO
+```
+
+**Data flow:**
+
+1. User sets `method=sample checkpoint_freq=N` (0 disables writes).
+2. CmdStan derives checkpoint paths from the output CSV basename: `{output}_checkpoint.json` (multi-chain: `{output}_checkpoint_{chain}.json`).
+3. During sampling, Stan saves checkpoint JSON every N **post-warmup transitions** via a `structured_writer` callback.
+4. On the next invocation, if a valid checkpoint file exists, CmdStan switches to **append mode** for CSV output, loads and validates the checkpoint, and Stan resumes from the saved iteration without re-running warmup.
+
+---
+
+## Stan Submodule Changes
+
+All paths below are relative to `stan/src/stan/`.
+
+### 1. `services/util/checkpoint_io.hpp` (new)
+
+**What:** Core checkpoint schema, serialization, and file I/O.
+
+**Why:** Stan should own the checkpoint format and read/write logic; CmdStan only supplies file paths and a writer callback. This matches Stan's callback-based I/O pattern and keeps the library usable outside CmdStan.
+
+**Key types:**
+
+| Type | Purpose |
+|------|---------|
+| `checkpoint_state` | In-memory representation of a checkpoint |
+| `checkpoint_options` | Per-chain options: frequency, writer pointer, resume state, `skip_headers` |
+| `checkpoint_save_callback` | Used by `generate_transitions` to trigger saves |
+
+**Checkpoint JSON fields (version 1):**
+
+```json
+{
+  "version": 1,
+  "chain_id": 1,
+  "phase": "sampling",
+  "iteration": 500,
+  "num_warmup": 200,
+  "num_samples": 800,
+  "thin": 1,
+  "random_seed": 1234,
+  "metric_type": "diag_e",
+  "step_size": 0.136,
+  "inv_metric": [...],
+  "last_position": [...],
+  "last_lp": -22.56,
+  "last_accept_stat": 0.983,
+  "rng_state": "..."
+}
+```
+
+**Design choices:**
+
+- **`iteration` is absolute** (includes warmup). Iteration 500 = 200 warmup + 300 sampling draws.
+- **`phase` must be `"sampling"`** for resume. Warmup checkpoints are rejected.
+- **RNG state** is stored as the string from `operator<<` on `stan::rng_t` (Boost mixmax). Round-trip via `operator>>` is tested.
+- **Atomic writes:** write to `{path}.tmp`, then `rename()` — same pattern as CmdStan's `atomic_checkpoint_writer`.
+- **Full double precision:** JSON writers use `std::numeric_limits<double>::max_digits10` to avoid resume drift from truncated floats (this was a real bug during development).
+
+**Functions:**
+
+- `read_checkpoint` / `write_checkpoint` — file-level I/O
+- `read_checkpoint_json` / `serialize_checkpoint` — string-level I/O
+- `checkpoint_exists` — validates file is readable JSON with version 1
+- `write_checkpoint_to_writer` — writes via `structured_writer` callback
+
+### 2. `services/util/generate_transitions.hpp`
+
+**What:** Added optional checkpoint saving at the end of each sampling transition.
+
+**Why:** Checkpoints must be taken **after** `sampler.transition()` completes, capturing the post-transition `mcmc::sample` — the correct continuation point for the next draw.
+
+**New parameters:**
+
+- `num_warmup` — needed to compute sampling-transition index
+- `checkpoint_freq` — save every N post-warmup transitions (0 disables)
+- `save_checkpoint` — callback `(absolute_iteration, sample) -> void`
+
+**Checkpoint timing formula:**
+
+```
+(absolute_iteration - num_warmup) % checkpoint_freq == 0
+```
+
+So with `num_warmup=200`, `checkpoint_freq=100`, checkpoints occur at absolute iterations 300, 400, 500, …
+
+### 3. `services/util/run_adaptive_sampler.hpp`
+
+**What:** Resume path that bypasses warmup and restores full sampler state.
+
+**Why:** The original plan incorrectly assumed patching only the sampling loop would suffice. Resume requires skipping warmup, disengaging adaptation, restoring metric/step size/RNG, and computing `remaining = finish - checkpoint.iteration`.
+
+**Resume path (when `checkpoint.resume != nullptr`):**
+
+1. Restore RNG from `rng_state` string
+2. Set `cont_vector` from `last_position`
+3. Restore inverse metric via `restore_sampler_metric()` (diag_e / dense_e only)
+4. `disengage_adaptation()`, `set_nominal_stepsize(state.step_size)`
+5. `sampler.seed(cont_params)` to sync internal Hamiltonian state
+6. Construct `mcmc::sample` from `last_position`, `last_lp`, `last_accept_stat`
+7. Skip CSV headers if `checkpoint.skip_headers` (append mode)
+8. Run `generate_transitions(remaining, state.iteration, finish, …)` for sampling only
+9. Write timing with `warm_delta_t = 0.0`
+
+**Normal path additions:**
+
+- Builds `save_checkpoint` lambda that calls `build_checkpoint_state()` + `write_checkpoint_to_writer()`
+- Passes `checkpoint.freq` and callback into the sampling-phase `generate_transitions` call
+
+**Bug fixed during development:** An `Eigen::Map` over `cont_vector` was created before the resume path could reassign `cont_vector`, leaving a dangling pointer. The map is now created only after position restoration.
+
+**`build_checkpoint_state()` captures:**
+
+- Run metadata (chain, seed, warmup, samples, thin)
+- `metric_type`, `step_size`, `inv_metric` from sampler getters
+- Post-transition sample: position, log prob, accept stat
+- RNG state string
+
+### 4. `mcmc/hmc/base_hmc.hpp`
+
+**What:** Added `get_inv_metric()` and `get_metric_type()` with internal overloads for `ps_point`, `diag_e_point`, `unit_e_point`, `dense_e_point`.
+
+**Why:** Checkpoints must persist the adapted mass matrix. These getters did not exist; the plan originally referenced incorrect API names.
+
+**Note:** `unit_e` returns the identity metric vector; `ps_point` returns empty (static HMC path — not wired for checkpointing).
+
+### 5. `mcmc/hmc/hamiltonians/{diag,dense,unit}_e_point.hpp`
+
+**What:** `metric_type()` made `const`.
+
+**Why:** Required so `get_metric_type()` can be called on const sampler state.
+
+### 6. `services/sample/hmc_nuts_{diag,dense,unit}_e_adapt.hpp`
+
+**What:** All service entry points accept `checkpoint_options` (default empty). Multi-chain overloads pass per-chain options. `run_adaptive_sampler` receives `random_seed` and `checkpoint`.
+
+**Why:** CmdStan calls these services; checkpoint options must flow from CLI to the sampler loop.
+
+**diag_e / dense_e resume optimization:** When `checkpoint.resume != nullptr`, skip `initialize()` and metric file reading; position comes from checkpoint. Adaptation setup (metric, step size, window params) is also skipped — restored inside `run_adaptive_sampler`.
+
+**unit_e gap:** `hmc_nuts_unit_e_adapt` does **not** skip initialization on resume. It still calls `initialize()` and sets up adaptation before `run_adaptive_sampler` overwrites state. Functionally correct but wasteful; see Open Issues.
+
+### 7. `test/unit/services/util/checkpoint_io_test.cpp` (new, not yet in Makefile)
+
+**What:** Unit tests for JSON round-trip, atomic file I/O, error handling, and fixture RNG restoration.
+
+**Status:** File exists and tests pass when built manually, but is **not wired into Stan's test Makefile** yet.
+
+---
+
+## CmdStan Changes
+
+All paths below are relative to `src/cmdstan/` unless noted.
+
+### 1. `arguments/arg_sample.hpp`
+
+**What:** New argument `checkpoint_freq` (non-negative int, default 0).
+
+**Why:** User-facing control for checkpoint interval. `0` disables periodic writes (but resume still works if a checkpoint file exists from a prior run).
+
+```
+method=sample checkpoint_freq=100
+```
+
+### 2. `command_helper.hpp`
+
+**What:** CmdStan-side checkpoint infrastructure.
+
+| Addition | Purpose |
+|----------|---------|
+| `init_append_writers()` | Open CSV writers in append mode for resume |
+| `atomic_checkpoint_writer` | `structured_writer` that atomically writes JSON to disk |
+| `checkpoint_filenames()` | `{output}_checkpoint.json` naming via `file::make_filenames` |
+| `validate_checkpoint_for_resume()` | Enforce matching seed, chain, warmup, samples, thin, phase, iteration range |
+| `remove_checkpoint_files()` | Delete checkpoint + `.tmp` files on successful completion |
+
+**Why `atomic_checkpoint_writer` in CmdStan, not Stan:** Stan uses a callback interface; CmdStan owns file paths and atomic rename semantics. The writer buffers JSON in memory, writes to `.tmp`, then renames.
+
+### 3. `command.hpp`
+
+**What:** Full CLI integration for checkpoint/resume.
+
+**Early setup (before writers):**
+
+- Read `checkpoint_freq`
+- Compute per-chain checkpoint paths
+- Set `resume_sampling = true` if any chain's checkpoint file exists and parses
+
+**Writer initialization:**
+
+- **Resume:** `init_append_writers` for sample (and diagnostic CSV if configured)
+- **Fresh run:** existing `init_filestream_writers` (truncate/create)
+
+**Config headers:**
+
+- Skip `write_config` / diagnostic header block when `resume_sampling` — avoids duplicating `#` comment lines in appended CSV
+
+**Before HMC sampling:**
+
+- Load checkpoints per chain
+- Validate each against command-line settings
+- Build `checkpoint_opts` vector (freq, writer, resume pointer, skip_headers)
+- Pass `checkpoint_opts` to all `hmc_nuts_*_adapt` calls in the NUTS engine block
+
+**After successful completion:**
+
+```cpp
+if (return_code == OK && checkpoint_freq > 0
+    && std::getenv("CMDSTAN_KEEP_CHECKPOINT") == nullptr) {
+  remove_checkpoint_files(checkpoint_paths);
+}
+```
+
+**Why delete on success:** Checkpoints are a crash-recovery mechanism, not a permanent artifact. `CMDSTAN_KEEP_CHECKPOINT=1` preserves them for debugging (used in tests and fixture generation).
+
+### 4. `make/tests`
+
+**What:** Added `checkpoint_resume_test` target depending on `eight_schools` and `test_model`.
+
+### 5. `src/test/utility.hpp`
+
+**What:** `compare_sample_csv()` helper — compares numeric rows between two Stan CSVs with optional row range (`from_row`, `to_row`).
+
+**Why:** Golden-file tests need to verify that rows 1–300 (pre-checkpoint prefix) and 301–800 (post-resume tail) match an uninterrupted reference run.
+
+### 6. `src/test/interface/checkpoint_resume_test.cpp` (new)
+
+**What:** Integration test suite (10 tests, all passing).
+
+| Test | What it verifies |
+|------|------------------|
+| `compare_sample_csv_identical_files` | Utility helper works |
+| `checkpoint_json_valid` | Checkpoint file is valid JSON |
+| `checkpoint_naming_multi_chain` | Per-chain `_checkpoint_{n}.json` files created |
+| `resume_prefix_matches_golden` | Rows 1–300 match golden after resume |
+| `resume_tail_matches_golden` | Rows 301–800 match golden after resume |
+| `freq_zero_no_file` | No checkpoint written when freq=0 |
+| `mismatched_warmup_errors` | Validation rejects changed `num_warmup` |
+| `checkpoint_removed_on_success` | Checkpoint deleted after clean completion |
+| `CheckpointResumeDense.resume_tail_matches_golden` | dense_e metric resume works |
+| `CheckpointResumeMultiChain.resume_tail_matches_golden` | Two-chain resume (see caveat below) |
+
+**Test pattern:**
+
+1. Copy first 300 data rows from golden CSV into output file (simulates interrupted run)
+2. Copy fixture checkpoint JSON to expected checkpoint path
+3. Re-run with same settings — auto-detects resume
+4. Compare output to golden CSV
+
+### 7. `src/test/interface/fixtures/checkpoint/` (new)
+
+**What:** Golden CSVs, checkpoint JSONs, regeneration script, and diagnostic plots.
+
+| File | Description |
+|------|-------------|
+| `golden_full.csv` | Uninterrupted diag_e eight_schools run (seed=1234, 800 draws) |
+| `checkpoint_at_500.json` | Checkpoint at absolute iteration 500 |
+| `dense/golden_full.csv` | Uninterrupted dense_e test_model run (seed=5678) |
+| `dense/checkpoint_at_500.json` | dense_e checkpoint at iteration 500 |
+| `multi_chain/golden_chain_{1,2}.csv` | Two-chain eight_schools (seed=9012) |
+| `multi_chain/checkpoint_chain_{1,2}_at_500.json` | Per-chain checkpoints |
+| `regenerate_fixtures.sh` | Regenerates all fixtures; patches `num_samples` in captured checkpoints |
+| `resume_equivalence_*.png` | Visual verification plots (scatter, trace, split) |
+
+**Fixture generation trick:** Run only 300 sampling iterations with `checkpoint_freq=100` to capture the iteration-500 checkpoint, then patch `num_samples` from 300 → 800 in the JSON so resume tests expect a full 800-draw run.
+
+---
+
+## Design Decisions
+
+### 1. Structured writer callback (not paths in Stan)
+
+Stan receives a `structured_writer*` and writes checkpoint JSON through it. CmdStan implements the writer that persists to disk. This keeps Stan independent of filesystem policy and is more likely to be accepted upstream.
+
+### 2. `checkpoint_freq` counts raw sampling transitions
+
+Frequency is measured in post-warmup MCMC transitions, not thinned output rows. With `thin=2`, checkpoints still fire every `checkpoint_freq` transitions; output rows are still thinned.
+
+### 3. Automatic resume (no `--resume` flag)
+
+If a valid checkpoint file exists at the expected path, CmdStan enters resume mode. The user must pass identical `random seed`, `num_warmup`, `num_samples`, `thin`, and `id`. Changing any of these throws a validation error.
+
+### 4. Checkpoint deleted on successful completion
+
+Unless `CMDSTAN_KEEP_CHECKPOINT=1` is set. Prevents stale checkpoints from accidentally triggering resume on the next run with the same output basename.
+
+### 5. Sampling-phase only
+
+Warmup adaptation state (windowed mass matrix updates, step-size adaptation in progress) is not serialized. A checkpoint taken during warmup would be insufficient to continue adaptation correctly.
+
+### 6. Post-transition sample as continuation point
+
+The checkpoint stores the state **after** transition N completes. Resume starts transition N+1. This matches the golden test design where rows 1–300 are already in the CSV and row 301 is the first new draw.
+
+### 7. Bit-identical CSV comparison
+
+Tests use exact `double` equality on parsed CSV values, not tolerance-based comparison. This is strict but caught real bugs (float truncation, stale Eigen maps).
+
+---
+
+## Bugs Found and Fixed During Development
+
+1. **Float truncation in checkpoint JSON** — Default `ostringstream` precision (~6 digits) caused `last_position` to differ from in-memory state; resumed chain diverged at draw 301. Fixed with `max_digits10` on all checkpoint JSON writers.
+
+2. **Stale `Eigen::Map`** — `cont_params` map was created before `cont_vector` reassignment on resume, pointing at freed memory. Fixed by moving map creation after restoration.
+
+3. **Fixture staleness** — After precision fix, all golden checkpoints were regenerated via `regenerate_fixtures.sh`.
+
+---
+
+## Open Issues and Known Limitations
+
+### Coverage gaps
+
+| Area | Status |
+|------|--------|
+| Warmup checkpointing | Not implemented (by design for v1) |
+| Static HMC (`engine=static`) | Not wired |
+| Non-adaptive HMC | Not wired |
+| `unit_e` init on resume | Still runs `initialize()` unnecessarily |
+| Pathfinder, VI, Laplace | Unaffected |
+| Stan `checkpoint_io_test` in Makefile | Test file exists but not in build |
+| User-facing docs / `help` text examples | Only `help-all` shows the new arg |
+
+### Multi-chain chain 2 drift
+
+`CheckpointResumeMultiChain` only asserts chain 2 matches through row **539**, not 800. Comment in test:
+
+> Chain 2 matches through row 539; sub-ULP drift appears at row 540 for id=2.
+
+Chain 1 passes the full tail comparison. The chain-2 drift may be related to parallel chain execution and checkpoint capture timing; needs investigation if bit-identical multi-chain resume is required.
+
+### No explicit resume flag
+
+Resume is implicit (checkpoint file exists). Users who keep `CMDSTAN_KEEP_CHECKPOINT=1` and re-run with the same output path will always resume. They must delete the checkpoint manually to start fresh.
+
+### Validation strictness
+
+`validate_checkpoint_for_resume` does **not** check:
+
+- Model name or data file
+- Algorithm settings (max_depth, adapt_delta, etc.)
+- Metric file contents (only what's stored in checkpoint)
+
+Mismatch in these settings could produce silently wrong continuations.
+
+### Upstream integration
+
+- Requires matching changes in **stan-dev/stan** (submodule PR) before CmdStan PR can merge
+- **cmdstanr** / **brms** need to pass `checkpoint_freq` and manage `output_dir` / checkpoint paths for end-to-end wrapper testing
+- A reported R session crash after brms sampling was investigated; sampling itself completed successfully — likely a post-processing issue in the R stack, not CmdStan checkpoint code
+
+### Checkpoint file naming vs. output redirection
+
+Checkpoint paths are derived from `output file=`. Wrapper packages using `output_dir` / `output_basename` (cmdstanr) must ensure the output path used by CmdStan aligns with where checkpoints are expected.
+
+---
+
+## How to Test
+
+### CmdStan integration tests
+
+```bash
+python3 runCmdStanTests.py src/test/interface/checkpoint_resume_test.cpp
+```
+
+### Regenerate fixtures (after algorithm changes)
+
+```bash
+./src/test/interface/fixtures/checkpoint/regenerate_fixtures.sh
+```
+
+### Manual smoke test
+
+```bash
+# Full run
+./my_model random seed=1234 method=sample num_warmup=200 num_samples=800 \
+  checkpoint_freq=100 output file=out.csv
+
+# Simulate interrupt: keep partial CSV + checkpoint, then re-run same command
+CMDSTAN_KEEP_CHECKPOINT=1 ./my_model random seed=1234 method=sample \
+  num_warmup=200 num_samples=800 checkpoint_freq=100 output file=out.csv
+# CmdStan appends to out.csv and continues from checkpoint
+```
+
+### With brms / cmdstanr
+
+Point `CMDSTAN` at this fork, ensure cmdstanr passes `checkpoint_freq`, and use `output_dir` so CSV and checkpoint files land in a persistent directory. See [checkpoint fixture README](../src/test/interface/fixtures/checkpoint/README.md) for file naming.
+
+---
+
+## File Change Index
+
+### Stan submodule (modified + new)
+
+| File | Change |
+|------|--------|
+| `services/util/checkpoint_io.hpp` | **New** — schema, I/O, options |
+| `services/util/generate_transitions.hpp` | Checkpoint callback hook |
+| `services/util/run_adaptive_sampler.hpp` | Resume path, state build/restore |
+| `mcmc/hmc/base_hmc.hpp` | `get_inv_metric()`, `get_metric_type()` |
+| `mcmc/hmc/hamiltonians/*_e_point.hpp` | `metric_type() const` |
+| `services/sample/hmc_nuts_{diag,dense,unit}_e_adapt.hpp` | `checkpoint_options` parameter |
+| `test/unit/services/util/checkpoint_io_test.cpp` | **New** — unit tests |
+
+### CmdStan
+
+| File | Change |
+|------|--------|
+| `arguments/arg_sample.hpp` | `checkpoint_freq` argument |
+| `command.hpp` | Resume detection, writer mode, validation, wiring |
+| `command_helper.hpp` | Append writers, atomic writer, validation, cleanup |
+| `make/tests` | Test target |
+| `test/utility.hpp` | `compare_sample_csv()` |
+| `test/interface/checkpoint_resume_test.cpp` | **New** — integration tests |
+| `test/interface/fixtures/checkpoint/*` | **New** — golden files, script, plots |
+
+---
+
+## Current Status
+
+- All 10 integration tests pass
+- diag_e, dense_e single-chain resume: bit-identical through 800 draws
+- Multi-chain: chain 1 full match; chain 2 partial match (rows 301–539)
+- Changes are local (stan submodule is dirty; not yet pushed as separate PRs)
