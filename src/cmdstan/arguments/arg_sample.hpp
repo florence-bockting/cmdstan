@@ -27,6 +27,9 @@ class arg_sample : public categorical_argument {
     _subarguments.push_back(new arg_sample_algo());
     _subarguments.push_back(
         new arg_single_int_pos("num_chains", "Number of chains", 1));
+    _subarguments.push_back(new arg_single_int_nonneg(
+        "checkpoint_freq",
+        "Save a sampling checkpoint every N transitions (0 disables)", 0));
   }
 };
 
